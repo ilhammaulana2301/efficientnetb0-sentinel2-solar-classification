@@ -1,0 +1,268 @@
+//  Peneliti  : Ilham Maulana                                   
+//  Institusi : Universitas Syiah Kuala                      
+//  Tahun     : 2026                                            
+
+
+// ================================================================
+// BAGIAN 1: KONFIGURASI GLOBAL
+// ================================================================
+
+// Periode pengambilan data
+var TAHUN_MULAI  = '2024-01-01';
+var TAHUN_AKHIR  = '2024-12-31';
+
+// Periode CADANGAN (lebih panjang) - dipakai HANYA untuk mengisi
+// celah NoData yang masih tersisa setelah komposit tahun utama.
+// Ini tidak menggantikan citra tahun 2024, hanya "tambal sulam"
+// pada piksel yang benar-benar tidak punya observasi bersih di 2024.
+var TAHUN_CADANGAN_MULAI = '2022-01-01';
+var TAHUN_CADANGAN_AKHIR = '2024-12-31';
+
+// Asset GHI dari Global Solar Atlas (SolarGIS) yang sudah diupload manual
+var GHI_ASSET_PATH = 'projects/dataset-459817/assets/GHI_GlobalSolarAtlas';
+
+// Threshold cloud masking Sentinel-2
+// Dinaikkan dari 10% -> 25% untuk memperbanyak "kandidat pool" citra,
+// terutama krusial untuk wilayah yang sangat berawan sepanjang tahun
+// (misal Jayapura, Papua). Ini TIDAK membuat hasil akhir lebih berawan,
+// karena piksel awan tetap dibuang di Lapis 2 (SCL masking per piksel).
+// Melonggarkan ambang ini hanya menambah jumlah citra kandidat yang
+// tersedia untuk komposit median di Lapis 3, sehingga peluang setiap
+// piksel mendapat observasi bersih sepanjang tahun meningkat.
+var MAX_CLOUD_PERSEN = 25;
+
+// Folder output di Google Drive
+var FOLDER_OUTPUT = 'SolarPanel_Dataset_2024';
+
+// Skala resolusi output (meter)
+var SKALA_OUTPUT = 10;
+
+// Sistem koordinat referensi
+var CRS = 'EPSG:4326';
+
+
+// ================================================================
+// BAGIAN 2: DEFINISI AREA OF INTEREST (AOI) - GAMBAR SENDIRI
+// ================================================================
+
+var kota = {
+  'BandaAceh' : { aoi: BandaAceh,  pulau: 'Sumatera' },
+  'Jakarta'   : { aoi: Jakarta,    pulau: 'Jawa' },
+  'Bandung'   : { aoi: Bandung,    pulau: 'Jawa' },
+  'Yogyakarta': { aoi: Yogyakarta, pulau: 'Jawa' },
+  'Surabaya'  : { aoi: Surabaya,   pulau: 'Jawa' },
+  'Kediri'    : { aoi: Kediri,     pulau: 'Jawa' },
+  'Denpasar'  : { aoi: Denpasar,   pulau: 'Bali' },
+  'Pontianak' : { aoi: Pontianak,  pulau: 'Kalimantan' },
+  'Makassar'  : { aoi: Makassar,   pulau: 'Sulawesi' },
+  'Jayapura'  : { aoi: Jayapura,   pulau: 'Papua' }
+};
+
+var namaKota = Object.keys(kota);
+
+
+// ================================================================
+// BAGIAN 2B: LOAD ASSET GHI (GLOBAL SOLAR ATLAS)
+// ================================================================
+
+var ghiMentah = ee.Image(GHI_ASSET_PATH);
+print('Info Asset GHI:', ghiMentah);
+
+
+// ================================================================
+// BAGIAN 3: FUNGSI CLOUD MASKING SENTINEL-2 (MENGGUNAKAN SCL)
+// ================================================================
+
+function maskAwanS2(image) {
+  var scl = image.select('SCL');
+
+  var mask = scl.neq(3)
+                .and(scl.neq(8))
+                .and(scl.neq(9))
+                .and(scl.neq(10));
+
+  return image
+    .updateMask(mask)
+    .divide(10000)
+    .copyProperties(image, ['system:time_start']);
+}
+
+
+// ================================================================
+// BAGIAN 4: FUNGSI PENGAMBILAN DATA PER KOTA
+// ================================================================
+
+function ambilDataKota(namaKota, infoKota) {
+
+  var aoi = infoKota.aoi;
+
+  print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  print('Memproses kota:', namaKota);
+  print('Pulau         :', infoKota.pulau);
+  print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+
+  // --------------------------------------------------------------
+  // 4A. SENTINEL-2 RGB - KOMPOSIT UTAMA (TAHUN 2024)
+  // --------------------------------------------------------------
+
+  var s2KoleksiUtama = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(aoi)
+    .filterDate(TAHUN_MULAI, TAHUN_AKHIR)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', MAX_CLOUD_PERSEN))
+    .map(maskAwanS2)
+    .select(['B4', 'B3', 'B2']);
+
+  print('Jumlah citra S2 (utama, 2024) - ' + namaKota + ':',
+        s2KoleksiUtama.size());
+
+  var s2Utama = s2KoleksiUtama.median();
+
+  // --------------------------------------------------------------
+  // 4A-2. KOMPOSIT CADANGAN (MULTI-TAHUN, UNTUK TAMBAL CELAH NODATA)
+  // --------------------------------------------------------------
+  // Dipakai HANYA untuk mengisi piksel yang benar-benar tidak
+  // memiliki observasi bersih sepanjang 2024. Menggunakan rentang
+  // tahun lebih panjang (2022-2024) dan ambang cloud lebih longgar
+  // agar kandidat citra jauh lebih banyak.
+
+  var s2KoleksiCadangan = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(aoi)
+    .filterDate(TAHUN_CADANGAN_MULAI, TAHUN_CADANGAN_AKHIR)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+    .map(maskAwanS2)
+    .select(['B4', 'B3', 'B2']);
+
+  print('Jumlah citra S2 (cadangan, 2022-2024) - ' + namaKota + ':',
+        s2KoleksiCadangan.size());
+
+  var s2Cadangan = s2KoleksiCadangan.median();
+
+  // --------------------------------------------------------------
+  // GABUNGKAN: piksel NoData di komposit utama diisi dari cadangan
+  // Piksel yang SUDAH ada nilainya di komposit utama TIDAK diubah.
+  // --------------------------------------------------------------
+
+  var s2RGB = s2Utama
+    .unmask(s2Cadangan)
+    .clip(aoi)
+    .rename(['Red', 'Green', 'Blue']);
+
+
+  // --------------------------------------------------------------
+  // 4B. DYNAMIC WORLD - TUTUPAN LAHAN
+  // --------------------------------------------------------------
+
+  var dwTutupanLahan = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+    .filterBounds(aoi)
+    .filterDate(TAHUN_CADANGAN_MULAI, TAHUN_AKHIR)  // rentang lebih panjang
+    .select(['label'])
+    .reduce(ee.Reducer.mode())
+    .rename(['tutupan_lahan'])
+    .clip(aoi);
+
+
+  // --------------------------------------------------------------
+  // 4C. SRTM DEM - SLOPE
+  // --------------------------------------------------------------
+
+  var dem   = ee.Image('USGS/SRTMGL1_003');
+  var slope = ee.Terrain.slope(dem)
+    .reproject({ crs: CRS, scale: SKALA_OUTPUT })
+    .rename(['slope_derajat'])
+    .clip(aoi);
+
+
+  // --------------------------------------------------------------
+  // 4C-2. GHI - GLOBAL SOLAR ATLAS
+  // --------------------------------------------------------------
+
+  var ghi = ghiMentah
+    .reproject({ crs: CRS, scale: SKALA_OUTPUT })
+    .rename(['ghi_kwh_m2_hari'])
+    .clip(aoi);
+
+
+  // --------------------------------------------------------------
+  // 4D-EXTRA. CEK SISA NODATA SETELAH DIGABUNG (VERIFIKASI)
+  // --------------------------------------------------------------
+  // Hitung berapa persen piksel yang MASIH kosong bahkan setelah
+  // digabung dengan komposit cadangan multi-tahun. Kalau angka ini
+  // masih tinggi, berarti wilayah tersebut memang ekstrem berawan
+  // dan perlu penanganan tambahan (misal perbesar rentang cadangan).
+
+  var maskKosong = s2RGB.select('Red').mask().not();
+  var statistikKosong = maskKosong.reduceRegion({
+    reducer  : ee.Reducer.mean(),
+    geometry : aoi,
+    scale    : SKALA_OUTPUT,
+    maxPixels: 1e13
+  });
+  print('Proporsi piksel MASIH kosong setelah digabung cadangan - ' +
+        namaKota + ':', statistikKosong.get('Red'));
+
+
+  // --------------------------------------------------------------
+  // 4E. EXPORT KE GOOGLE DRIVE
+  // --------------------------------------------------------------
+
+  Export.image.toDrive({
+    image          : s2RGB.toFloat(),
+    description    : 'S2_RGB_' + namaKota + '_2024',
+    folder         : FOLDER_OUTPUT,
+    fileNamePrefix : 'S2_RGB_' + namaKota,
+    region         : aoi,
+    scale          : SKALA_OUTPUT,
+    crs            : CRS,
+    maxPixels      : 1e13,
+    fileFormat     : 'GeoTIFF'
+  });
+
+  Export.image.toDrive({
+    image          : dwTutupanLahan.toInt8(),
+    description    : 'DW_LC_' + namaKota + '_2024',
+    folder         : FOLDER_OUTPUT,
+    fileNamePrefix : 'DW_LC_' + namaKota,
+    region         : aoi,
+    scale          : SKALA_OUTPUT,
+    crs            : CRS,
+    maxPixels      : 1e13,
+    fileFormat     : 'GeoTIFF'
+  });
+
+  Export.image.toDrive({
+    image          : slope.toFloat(),
+    description    : 'SLOPE_' + namaKota,
+    folder         : FOLDER_OUTPUT,
+    fileNamePrefix : 'SLOPE_' + namaKota,
+    region         : aoi,
+    scale          : SKALA_OUTPUT,
+    crs            : CRS,
+    maxPixels      : 1e13,
+    fileFormat     : 'GeoTIFF'
+  });
+
+  Export.image.toDrive({
+    image          : ghi.toFloat(),
+    description    : 'GHI_' + namaKota,
+    folder         : FOLDER_OUTPUT,
+    fileNamePrefix : 'GHI_' + namaKota,
+    region         : aoi,
+    scale          : SKALA_OUTPUT,
+    crs            : CRS,
+    maxPixels      : 1e13,
+    fileFormat     : 'GeoTIFF'
+  });
+
+  print('✓ Export tasks berhasil dibuat untuk:', namaKota);
+  print('');
+}
+
+
+// ================================================================
+// BAGIAN 5: JALANKAN UNTUK SEMUA KOTA
+// ================================================================
+
+namaKota.forEach(function(nama) {
+  ambilDataKota(nama, kota[nama]);
+});
